@@ -11,8 +11,6 @@
 
 </div>
 
-<sub>sessão animada em SVG puro (SMIL) — reescrita por `scripts/update-stats.mjs` via `.github/workflows/stats.yml` — código próprio, sem Action de terceiro</sub>
-
 <br/>
 
 <div align="center">

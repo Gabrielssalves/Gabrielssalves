@@ -63,14 +63,43 @@ const BADGE_GAP = 7;
 
 const BLOCK_GAP = 26;
 
-const TYPE_CPS = 18;
-const MIN_TYPE = 0.45;
-const PAUSE_AFTER_TYPE = 0.35;
+const TYPE_CPS = 8;
+const CHAR_JITTER_MIN = 0.6;
+const CHAR_JITTER_MAX = 1.8;
+const HESITATION_CHANCE = 0.08;
+const HESITATION_MIN = 0.15;
+const HESITATION_MAX = 0.4;
+const MIN_TYPE = 0.6;
+const PAUSE_AFTER_TYPE = 0.4;
 const RAMP = 0.15;
-const DWELL_AFTER_OUTPUT = 0.6;
+const DWELL_BEFORE_TYPE = 0.6;
 const HOLD_AT_END = 14.0;
 const BLINK_PERIOD = "0.9s";
 const EPS = 0.0006;
+
+// Cumulative per-character reveal times (seconds, relative to typing start)
+// with randomized jitter and occasional hesitations, so typing reads like a
+// human at a keyboard rather than a constant-speed machine sweep.
+function buildCharTimeline(command, cps) {
+  const base = 1 / cps;
+  let t = 0;
+  const times = [];
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    let interval = base * (CHAR_JITTER_MIN + Math.random() * (CHAR_JITTER_MAX - CHAR_JITTER_MIN));
+    if (ch === " ") interval *= 1.3;
+    if (Math.random() < HESITATION_CHANCE) interval += HESITATION_MIN + Math.random() * (HESITATION_MAX - HESITATION_MIN);
+    t += Math.max(interval, 0.02);
+    times.push(t);
+  }
+  let typeDur = times.length ? times[times.length - 1] : 0;
+  if (typeDur < MIN_TYPE) {
+    const scale = typeDur > 0 ? MIN_TYPE / typeDur : 1;
+    for (let i = 0; i < times.length; i++) times[i] *= scale;
+    typeDur = MIN_TYPE;
+  }
+  return { times, typeDur };
+}
 
 function esc(s) {
   return String(s)
@@ -117,19 +146,24 @@ function buildPlan(stats) {
   let t = 0.2;
   const stages = [];
 
-  function addStage({ path, command, contentHeight, render }) {
+  function addStage({ path, command, contentHeight, render, topPad = 0 }) {
     const promptY = y + PROMPT_ROW_H - 6;
     const prefix = [seg("gabriel@arch", p.blue), seg(" ", p.text), seg(path, p.purple), seg(" ", p.text), seg("❯ ", p.green)];
     const prefixWidth = segsWidth(prefix, CHAR_W);
     const promptX = PAD_X + prefixWidth;
     const cmdWidth = command.length * CHAR_W + 5;
 
-    const typeDur = Math.max(MIN_TYPE, command.length / TYPE_CPS);
-    const tStart = t;
+    // The prompt line itself appears the instant the previous stage's
+    // output is done rendering (real terminals don't delay this); only the
+    // typing is held back a beat, as if the user paused before typing.
+    const tPromptShow = t;
+    const { times: charOffsets, typeDur } = buildCharTimeline(command, TYPE_CPS);
+    const tStart = tPromptShow + DWELL_BEFORE_TYPE;
     const tTypeEnd = tStart + typeDur;
     const tOutput = tTypeEnd + PAUSE_AFTER_TYPE;
+    const charTimes = charOffsets.map((off) => tStart + off);
 
-    const contentY = y + PROMPT_ROW_H + PROMPT_GAP;
+    const contentY = y + PROMPT_ROW_H + PROMPT_GAP + topPad;
     stages.push({
       kind: "stage",
       promptX,
@@ -137,6 +171,8 @@ function buildPlan(stats) {
       prefix,
       command,
       cmdWidth,
+      charTimes,
+      tPromptShow,
       tStart,
       tTypeEnd,
       tOutput,
@@ -146,7 +182,7 @@ function buildPlan(stats) {
     });
 
     y = contentY + contentHeight + BLOCK_GAP;
-    t = tOutput + DWELL_AFTER_OUTPUT;
+    t = tOutput;
   }
 
   // fastfetch
@@ -216,6 +252,7 @@ function buildPlan(stats) {
       path: "~/profile",
       command: "nvim about.cs",
       contentHeight,
+      topPad: 14,
       render: (x, cy) => {
         let out = `<rect x="${x - 10}" y="${cy - 14}" width="${CONTENT_W + 20}" height="${codeHeight + 10}" rx="6" fill="${p.surface2}"/>`;
         codeLines.forEach((segments, i) => {
@@ -306,7 +343,6 @@ function buildPlan(stats) {
           out += `<text x="${x}" y="${ly}" font-size="${CODE_FONT}"><tspan fill="${p.textMuted}">${esc(label)}</tspan><tspan fill="${p.text}" font-weight="600">${esc(value)}</tspan></text>`;
         });
         const capY = cy + rows.length * TEXT_ROW_H + 14;
-        out += `<text x="${x}" y="${capY}" font-size="${CAPTION_FONT}"><tspan fill="${p.textFaint}">escrito por </tspan><tspan fill="${p.textMuted}">scripts/update-stats.mjs</tspan><tspan fill="${p.textFaint}"> — código seu, sem lib de terceiro</tspan></text>`;
         return out;
       },
     });
@@ -350,38 +386,57 @@ function revealGroup(inner, startFrac, total, ramp = RAMP) {
 }
 
 function typedCommand(stage, total) {
-  const { promptX, promptY, command, cmdWidth, tStart, tTypeEnd } = stage;
+  const { promptX, promptY, command, cmdWidth, tStart, charTimes } = stage;
   const s0 = frac(tStart, total);
-  const s1 = frac(tTypeEnd, total);
   const clipId = `clip-${Math.round(promptX)}-${Math.round(promptY)}`;
-  const widthTimes = kt([0, s0, s1, 1]);
+  const n = command.length;
+  const keyTimesArr = [0, s0 - EPS];
+  const valuesArr = [0, 0];
+  for (let i = 0; i < n; i++) {
+    keyTimesArr.push(frac(charTimes[i], total));
+    valuesArr.push(i === n - 1 ? cmdWidth : (i + 1) * CHAR_W);
+  }
+  keyTimesArr.push(1);
+  valuesArr.push(n ? cmdWidth : 0);
+  const widthTimes = kt(keyTimesArr);
+  const widthValues = valuesArr.map((v) => v.toFixed(2)).join(";");
   return `
     <clipPath id="${clipId}">
       <rect x="${promptX}" y="${promptY - FONT}" height="${FONT + 6}" width="0">
-        <animate attributeName="width" values="0;0;${cmdWidth};${cmdWidth}" keyTimes="${widthTimes}" dur="${total.toFixed(3)}s" begin="0s" repeatCount="indefinite"/>
+        <animate attributeName="width" calcMode="discrete" values="${widthValues}" keyTimes="${widthTimes}" dur="${total.toFixed(3)}s" begin="0s" repeatCount="indefinite"/>
       </rect>
     </clipPath>
     <text x="${promptX}" y="${promptY}" font-size="${FONT}" fill="${p.text}" clip-path="url(#${clipId})">${esc(command)}</text>`;
 }
 
 function typingCursor(stage, total) {
-  const { promptX, promptY, cmdWidth, tStart, tTypeEnd, tOutput } = stage;
-  const s0 = frac(tStart, total);
-  const s1 = frac(tTypeEnd, total);
+  const { promptX, promptY, cmdWidth, command, tPromptShow, tOutput, charTimes } = stage;
+  const sShow = frac(tPromptShow, total);
   const s2 = frac(tOutput, total);
-  const xTimes = kt([0, s0, s1, s2, 1]);
-  const xValues = [promptX, promptX, promptX + cmdWidth, promptX + cmdWidth, promptX].map((v) => v.toFixed(1)).join(";");
-  const yValues = [promptY, promptY, promptY, promptY, promptY].map((v) => v.toFixed(1)).join(";");
-  const visTimes = kt([0, s0 - EPS, s0, s2, s2 + EPS, 1]);
+  const n = command.length;
+
+  const xKeyTimes = [0, sShow - EPS];
+  const xValues = [promptX, promptX];
+  for (let i = 0; i < n; i++) {
+    xKeyTimes.push(frac(charTimes[i], total));
+    xValues.push(promptX + (i === n - 1 ? cmdWidth : (i + 1) * CHAR_W));
+  }
+  xKeyTimes.push(s2);
+  xValues.push(promptX + cmdWidth);
+  xKeyTimes.push(1);
+  xValues.push(promptX);
+
+  const xTimes = kt(xKeyTimes);
+  const xVals = xValues.map((v) => v.toFixed(1)).join(";");
+  const yVals = xValues.map(() => promptY.toFixed(1)).join(";");
+  const visTimes = kt([0, sShow - EPS, sShow, s2, s2 + EPS, 1]);
   return `
     <g>
-      <animate attributeName="x" values="${xValues}" keyTimes="${xTimes}" dur="${total.toFixed(3)}s" begin="0s" repeatCount="indefinite"/>
-      <animate attributeName="y" values="${yValues}" keyTimes="${xTimes}" dur="${total.toFixed(3)}s" begin="0s" repeatCount="indefinite"/>
+      <animate attributeName="x" calcMode="discrete" values="${xVals}" keyTimes="${xTimes}" dur="${total.toFixed(3)}s" begin="0s" repeatCount="indefinite"/>
+      <animate attributeName="y" values="${yVals}" keyTimes="${xTimes}" dur="${total.toFixed(3)}s" begin="0s" repeatCount="indefinite"/>
       <g>
         <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="${visTimes}" dur="${total.toFixed(3)}s" begin="0s" repeatCount="indefinite"/>
-        <rect width="7" height="15" y="-13" fill="${p.green}">
-          <animate attributeName="opacity" values="1;1;0;0" keyTimes="0;0.5;0.55;1" dur="${BLINK_PERIOD}" begin="0s" repeatCount="indefinite"/>
-        </rect>
+        <rect width="7" height="15" y="-13" fill="${p.green}"/>
       </g>
     </g>`;
 }
@@ -393,7 +448,7 @@ export function renderSession(stats) {
   let body = "";
   for (const stage of stages) {
     const prefixText = `<text x="${PAD_X}" y="${stage.promptY}" font-size="${FONT}" font-weight="600">${tspans(stage.prefix)}</text>`;
-    body += revealGroup(prefixText, frac(stage.tStart, total), total, 0.02);
+    body += revealGroup(prefixText, frac(stage.tPromptShow, total), total, 0.02);
     body += typedCommand(stage, total);
     body += typingCursor(stage, total);
     const outputInner = stage.render(PAD_X, stage.contentY);
