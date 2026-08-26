@@ -1,10 +1,11 @@
 // scripts/update-stats.mjs
 //
 // Hits the GitHub GraphQL API directly for this account's public stats
-// and rewrites the block between the STATS markers in README.md.
+// and rewrites assets/terminal-session.svg with a fresh render.
 // No third-party action, no library — just fetch() and fs.
 
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
+import { renderSession } from "./lib/session-svg.mjs";
 
 const token = process.env.GITHUB_TOKEN;
 const login = process.env.REPO_OWNER;
@@ -61,10 +62,10 @@ async function main() {
     stars: repositories.nodes.reduce((sum, r) => sum + r.stargazerCount, 0),
     lastYear: contributionsCollection.contributionCalendar.totalContributions,
     streak: currentStreak(days),
-    topLangs: topLanguages(repositories.nodes, 3),
+    topLangs: topLanguages(repositories.nodes, 3).join(" · "),
   };
 
-  await writeReadme(stats);
+  await writeSessionSvg(stats);
 }
 
 function currentStreak(days) {
@@ -88,27 +89,10 @@ function topLanguages(repos, count) {
     .map(([name]) => name);
 }
 
-async function writeReadme(stats) {
-  const readme = await readFile("README.md", "utf8");
-
-  const block = [
-    "```text",
-    `stars      : ${stats.stars}`,
-    `last year  : ${stats.lastYear} contributions`,
-    `streak     : ${stats.streak} day${stats.streak === 1 ? "" : "s"}`,
-    `top langs  : ${stats.topLangs.join(" · ")}`,
-    "```",
-  ].join("\n");
-
-  const start = "<!-- STATS:START -->";
-  const end = "<!-- STATS:END -->";
-  const pattern = new RegExp(`${start}[\\s\\S]*?${end}`);
-
-  if (!pattern.test(readme)) {
-    throw new Error(`README.md is missing the ${start} / ${end} markers`);
-  }
-
-  await writeFile("README.md", readme.replace(pattern, `${start}\n${block}\n${end}`));
+async function writeSessionSvg(stats) {
+  const svg = renderSession(stats);
+  await mkdir("assets", { recursive: true });
+  await writeFile("assets/terminal-session.svg", svg);
 }
 
 main().catch((err) => {
